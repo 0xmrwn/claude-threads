@@ -1,0 +1,435 @@
+use crate::envelope::Envelope;
+use crate::error::{AppError, ErrorCode};
+use crate::index;
+use crate::paths::ResolvedPaths;
+use clap::{ArgAction, Args, Parser, Subcommand};
+use serde::Serialize;
+use serde_json::json;
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "claude-threads",
+    version,
+    about = "Query local Claude Code conversation archives with stable JSON.",
+    long_about = "Query, search, resolve, and read local Claude Code thread archives with deterministic JSON, predictable errors, and agent-friendly subcommands.",
+    after_help = "Examples:\n  claude-threads --json sync\n  claude-threads --json projects list\n  claude-threads --json threads search \"build a CLI\" --limit 20\n  claude-threads --json threads search \"refactor index\" --project sweatshop\n  claude-threads --json threads resolve \"Design claude-threads CLI\"\n  claude-threads --json threads read <thread-id>\n  claude-threads --json messages search \"archive format\" --role assistant\n  claude-threads --json events read <thread-id> --limit 50"
+)]
+pub struct Cli {
+    #[arg(long, global = true, action = ArgAction::SetTrue, help = "Emit machine-readable JSON to stdout")]
+    json: bool,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    #[command(about = "Refresh the local derived index from Claude archives")]
+    Sync(SyncArgs),
+    #[command(subcommand)]
+    #[command(about = "List indexed projects")]
+    Projects(ProjectCommand),
+    #[command(subcommand)]
+    #[command(about = "Search, resolve, and read normalized threads")]
+    Threads(ThreadCommand),
+    #[command(subcommand)]
+    #[command(about = "Search and read normalized messages")]
+    Messages(MessageCommand),
+    #[command(subcommand)]
+    #[command(about = "Read normalized event streams for a thread")]
+    Events(EventCommand),
+    #[command(subcommand)]
+    #[command(about = "Inspect index statistics")]
+    Index(IndexCommand),
+    #[command(subcommand)]
+    #[command(about = "Show resolved archive and index paths")]
+    Debug(DebugCommand),
+}
+
+#[derive(Debug, Args)]
+struct SyncArgs {
+    #[arg(long, action = ArgAction::SetTrue, help = "Rebuild the derived index from scratch")]
+    rebuild: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum ProjectCommand {
+    #[command(about = "List indexed projects, most recently active first")]
+    List(ListProjectsArgs),
+}
+
+#[derive(Debug, Args)]
+struct ListProjectsArgs {
+    #[arg(long, default_value_t = 50, help = "Maximum number of projects to return")]
+    limit: usize,
+}
+
+#[derive(Debug, Subcommand)]
+enum ThreadCommand {
+    #[command(about = "Search normalized top-level threads")]
+    Search(ThreadSearchArgs),
+    #[command(about = "Resolve a fuzzy thread reference to one exact thread id")]
+    Resolve(ResolveArgs),
+    #[command(about = "Read one exact thread by stable thread id")]
+    Read(ReadThreadArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum MessageCommand {
+    #[command(about = "Search normalized top-level messages")]
+    Search(MessageSearchArgs),
+    #[command(about = "Read one exact message by stable message id")]
+    Read(ReadMessageArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum EventCommand {
+    #[command(about = "Read the event stream for one exact thread id")]
+    Read(ReadEventsArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum IndexCommand {
+    #[command(about = "Show index counts, source roots, and last sync time")]
+    Stats,
+}
+
+#[derive(Debug, Subcommand)]
+enum DebugCommand {
+    #[command(about = "Show resolved archive discovery and index paths")]
+    Paths,
+}
+
+#[derive(Debug, Args)]
+struct ThreadSearchArgs {
+    #[arg(help = "Search query")]
+    query: String,
+    #[arg(
+        long,
+        default_value_t = 20,
+        help = "Maximum number of results to return"
+    )]
+    limit: usize,
+    #[arg(
+        long,
+        allow_hyphen_values = true,
+        help = "Filter by project slug, full cwd, or substring (matches one project)"
+    )]
+    project: Option<String>,
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        help = "Include subagent / sidechain threads in results"
+    )]
+    include_subagents: bool,
+}
+
+#[derive(Debug, Args)]
+struct MessageSearchArgs {
+    #[arg(help = "Search query")]
+    query: String,
+    #[arg(
+        long,
+        default_value_t = 20,
+        help = "Maximum number of results to return"
+    )]
+    limit: usize,
+    #[arg(
+        long,
+        allow_hyphen_values = true,
+        help = "Filter by project slug, full cwd, or substring (matches one project)"
+    )]
+    project: Option<String>,
+    #[arg(long, help = "Filter by role (user|assistant)")]
+    role: Option<String>,
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        help = "Include messages from subagent / sidechain threads"
+    )]
+    include_subagents: bool,
+}
+
+#[derive(Debug, Args)]
+struct ResolveArgs {
+    #[arg(help = "Thread id, exact title, or fuzzy thread reference")]
+    query: String,
+}
+
+#[derive(Debug, Args)]
+struct ReadThreadArgs {
+    #[arg(help = "Stable thread id")]
+    thread_id: String,
+}
+
+#[derive(Debug, Args)]
+struct ReadMessageArgs {
+    #[arg(help = "Stable message id")]
+    message_id: String,
+}
+
+#[derive(Debug, Args)]
+struct ReadEventsArgs {
+    #[arg(help = "Stable thread id")]
+    thread_id: String,
+    #[arg(
+        long,
+        default_value_t = 50,
+        help = "Maximum number of events to return"
+    )]
+    limit: usize,
+}
+
+pub fn run() -> i32 {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            let _ = error.print();
+            return error.exit_code();
+        }
+    };
+    let json_mode = cli.json;
+
+    let paths = match ResolvedPaths::discover() {
+        Ok(paths) => paths,
+        Err(error) => return emit_error("init", &error, json_mode, None),
+    };
+
+    match dispatch(cli, &paths) {
+        Ok(code) => code,
+        Err((command, error, auto_sync)) => emit_error(&command, &error, json_mode, auto_sync),
+    }
+}
+
+fn dispatch(cli: Cli, paths: &ResolvedPaths) -> Result<i32, (String, AppError, Option<bool>)> {
+    match cli.command {
+        Command::Sync(args) => {
+            let command = "sync";
+            match index::sync(paths, args.rebuild) {
+                Ok(summary) => {
+                    emit_success(command, cli.json, summary, None);
+                    Ok(0)
+                }
+                Err(error) => Err((command.to_string(), error, None)),
+            }
+        }
+        Command::Projects(command) => match command {
+            ProjectCommand::List(args) => {
+                let command = "projects list";
+                match index::list_projects(paths, args.limit) {
+                    Ok((items, auto_sync)) => {
+                        emit_success(
+                            command,
+                            cli.json,
+                            json!({ "items": items, "limit": args.limit }),
+                            Some(auto_sync),
+                        );
+                        Ok(0)
+                    }
+                    Err(error) => Err((command.to_string(), error, None)),
+                }
+            }
+        },
+        Command::Threads(command) => match command {
+            ThreadCommand::Search(args) => {
+                let command = "threads search";
+                match index::search_threads(
+                    paths,
+                    &args.query,
+                    args.limit,
+                    args.project.as_deref(),
+                    args.include_subagents,
+                ) {
+                    Ok((items, auto_sync)) => {
+                        emit_success(
+                            command,
+                            cli.json,
+                            json!({
+                                "items": items,
+                                "limit": args.limit,
+                                "project": args.project,
+                                "include_subagents": args.include_subagents,
+                            }),
+                            Some(auto_sync),
+                        );
+                        Ok(0)
+                    }
+                    Err(error) => Err((command.to_string(), error, None)),
+                }
+            }
+            ThreadCommand::Resolve(args) => {
+                let command = "threads resolve";
+                match index::resolve_thread(paths, &args.query) {
+                    Ok((thread, auto_sync)) => {
+                        emit_success(
+                            command,
+                            cli.json,
+                            json!({ "thread": thread }),
+                            Some(auto_sync),
+                        );
+                        Ok(0)
+                    }
+                    Err(error) => Err((command.to_string(), error, None)),
+                }
+            }
+            ThreadCommand::Read(args) => {
+                let command = "threads read";
+                match index::read_thread(paths, &args.thread_id) {
+                    Ok((thread, auto_sync)) => {
+                        emit_success(
+                            command,
+                            cli.json,
+                            json!({ "thread": thread }),
+                            Some(auto_sync),
+                        );
+                        Ok(0)
+                    }
+                    Err(error) => Err((command.to_string(), error, None)),
+                }
+            }
+        },
+        Command::Messages(command) => match command {
+            MessageCommand::Search(args) => {
+                let command = "messages search";
+                if let Some(role) = args.role.as_deref()
+                    && role != "user"
+                    && role != "assistant"
+                {
+                    return Err((
+                        command.to_string(),
+                        AppError::with_details(
+                            ErrorCode::UsageError,
+                            "--role must be 'user' or 'assistant'",
+                            json!({ "role": role }),
+                        ),
+                        None,
+                    ));
+                }
+                match index::search_messages(
+                    paths,
+                    &args.query,
+                    args.limit,
+                    args.project.as_deref(),
+                    args.role.as_deref(),
+                    args.include_subagents,
+                ) {
+                    Ok((items, auto_sync)) => {
+                        emit_success(
+                            command,
+                            cli.json,
+                            json!({
+                                "items": items,
+                                "limit": args.limit,
+                                "project": args.project,
+                                "role": args.role,
+                                "include_subagents": args.include_subagents,
+                            }),
+                            Some(auto_sync),
+                        );
+                        Ok(0)
+                    }
+                    Err(error) => Err((command.to_string(), error, None)),
+                }
+            }
+            MessageCommand::Read(args) => {
+                let command = "messages read";
+                match index::read_message(paths, &args.message_id) {
+                    Ok((message, auto_sync)) => {
+                        emit_success(
+                            command,
+                            cli.json,
+                            json!({ "message": message }),
+                            Some(auto_sync),
+                        );
+                        Ok(0)
+                    }
+                    Err(error) => Err((command.to_string(), error, None)),
+                }
+            }
+        },
+        Command::Events(command) => match command {
+            EventCommand::Read(args) => {
+                let command = "events read";
+                match index::read_events(paths, &args.thread_id, args.limit) {
+                    Ok((events, auto_sync)) => {
+                        emit_success(
+                            command,
+                            cli.json,
+                            json!({ "items": events, "limit": args.limit }),
+                            Some(auto_sync),
+                        );
+                        Ok(0)
+                    }
+                    Err(error) => Err((command.to_string(), error, None)),
+                }
+            }
+        },
+        Command::Index(command) => match command {
+            IndexCommand::Stats => {
+                let command = "index stats";
+                match index::stats(paths) {
+                    Ok((stats, auto_sync)) => {
+                        emit_success(command, cli.json, stats, Some(auto_sync));
+                        Ok(0)
+                    }
+                    Err(error) => Err((command.to_string(), error, None)),
+                }
+            }
+        },
+        Command::Debug(command) => match command {
+            DebugCommand::Paths => {
+                let command = "debug paths";
+                let payload = json!({
+                    "claude_home": paths.claude_home,
+                    "projects_root": paths.projects_root,
+                    "history_path": paths.history_path,
+                    "index_dir": paths.index_dir,
+                    "index_path": paths.index_path,
+                    "projects_root_exists": paths.projects_root.exists(),
+                    "history_exists": paths.history_path.exists(),
+                    "index_exists": paths.index_path.exists(),
+                });
+                emit_success(command, cli.json, payload, None);
+                Ok(0)
+            }
+        },
+    }
+}
+
+fn emit_success<T: Serialize>(command: &str, json_mode: bool, data: T, auto_sync: Option<bool>) {
+    if json_mode {
+        let envelope = Envelope::success(command, data, auto_sync);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&envelope).expect("envelope serialization must succeed")
+        );
+    } else {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&data).expect("text serialization must succeed")
+        );
+    }
+}
+
+fn emit_error(command: &str, error: &AppError, json_mode: bool, auto_sync: Option<bool>) -> i32 {
+    if json_mode {
+        let envelope = Envelope::failure(command, error, auto_sync);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&envelope)
+                .expect("error envelope serialization must succeed")
+        );
+    } else {
+        eprintln!("{error}");
+        if error.code().exit_code() == ErrorCode::Ambiguous.exit_code()
+            && let Some(details) = error.body().details
+        {
+            eprintln!(
+                "{}",
+                serde_json::to_string_pretty(&details)
+                    .expect("error detail serialization must succeed")
+            );
+        }
+    }
+    error.exit_code()
+}
