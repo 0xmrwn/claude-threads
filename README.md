@@ -73,11 +73,13 @@ its own.
 ```bash
 claude-threads --json sync
 claude-threads --json projects list
+claude-threads --json threads list --project /Users/me/Projects/sweatshop --order asc --limit 1
 claude-threads --json threads search "build a CLI" --limit 20
 claude-threads --json threads search "refactor index" --project /Users/me/Projects/sweatshop
 claude-threads --json threads search "review the audit" --include-subagents
 claude-threads --json threads resolve "design doctrine"
 claude-threads --json threads read <thread-id>
+claude-threads --json messages list --project /Users/me/Projects/sweatshop --role user --order asc --limit 1
 claude-threads --json messages search "compaction protocol" --role assistant --limit 20
 claude-threads --json messages read <message-id>
 claude-threads --json events read <thread-id> --limit 50
@@ -89,9 +91,10 @@ claude-threads --json debug paths
 
 - Source archives are read-only
 - The derived index lives under `$CLAUDE_HOME/claude-threads/index.sqlite` or `~/.claude/claude-threads/index.sqlite`
-- `sync` is explicit, but read/search commands also auto-sync when the index is missing or stale
+- `sync` is explicit, but read/search/list commands also auto-sync when the index is missing or stale
 - If another `claude-threads` process is already syncing, read commands fall back to the current index instead of failing on a write lock
-- Subagent files (under `{session-uuid}/subagents/agent-*.jsonl`) are indexed with stable ids of the form `{parent_session_id}:agent:{hash}` and excluded from default search; pass `--include-subagents` to include them
+- Subagent files (under `{session-uuid}/subagents/agent-*.jsonl`) are indexed with stable ids of the form `{parent_session_id}:agent:{hash}` and excluded from default search/list; pass `--include-subagents` to include them
+- `threads list` and `messages list` provide chronological ordering with `--order asc|desc`; `messages list` also supports `--role user|assistant` for questions like "what was my first message in this project?". `threads list` orders by `started_at` with `updated_at` fallback; `messages list` orders by `timestamp`. Rows with null timestamps always sort to the end, regardless of direction
 - Threads continued via `/compact` are flagged with `was_compacted: true`; the synthetic compact-summary message is searchable as `kind=compact_summary` but never used as the thread title. Compact-summary `text` is capped at 16,000 bytes in the index — to read the full summary, use `events read <thread-id>` and locate the matching ordinal
 - Title derivation skips `<command-name>`, `<local-command-caveat>`, and `isMeta` records, then falls back to `~/.claude/history.jsonl` enrichment, then to the session UUID
 
