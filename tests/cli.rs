@@ -176,7 +176,10 @@ fn threads_read_returns_exact_thread() {
     assert_eq!(status, 0);
     let thread = &json["data"]["thread"];
     assert_eq!(thread["thread_id"], THREAD_ONE);
-    assert_eq!(thread["title"], "build a CLI for searching past Claude threads");
+    assert_eq!(
+        thread["title"],
+        "build a CLI for searching past Claude threads"
+    );
     assert_eq!(thread["project_slug"], PROJECT_ONE_SLUG);
     assert_eq!(thread["project_cwd"], "/workspace/project-one");
     assert_eq!(thread["message_count"], 3);
@@ -252,14 +255,7 @@ fn messages_search_role_filter_narrows_results() {
     let (status, json, _stderr) = run_json(
         &temp,
         &[
-            "--json",
-            "messages",
-            "search",
-            "Tweet",
-            "--role",
-            "user",
-            "--limit",
-            "10",
+            "--json", "messages", "search", "Tweet", "--role", "user", "--limit", "10",
         ],
     );
     assert_eq!(status, 0);
@@ -274,14 +270,7 @@ fn messages_search_invalid_role_returns_usage_error() {
     let _ = run_json(&temp, &["--json", "sync"]);
     let (status, json, _stderr) = run_json(
         &temp,
-        &[
-            "--json",
-            "messages",
-            "search",
-            "Tweet",
-            "--role",
-            "system",
-        ],
+        &["--json", "messages", "search", "Tweet", "--role", "system"],
     );
     assert_eq!(status, 2);
     assert_eq!(json["error"]["code"], "usage_error");
@@ -323,7 +312,11 @@ fn messages_search_project_filter_excludes_other_projects() {
     );
     assert_eq!(status, 0);
     let items = json["data"]["items"].as_array().expect("items array");
-    assert!(items.iter().any(|item| item["thread_id"] == PROJ_TWO_THREAD));
+    assert!(
+        items
+            .iter()
+            .any(|item| item["thread_id"] == PROJ_TWO_THREAD)
+    );
 }
 
 #[test]
@@ -396,8 +389,7 @@ fn malformed_history_is_ignored_as_enrichment_only() {
     let temp = copied_fixture_home();
     let history_path = temp.path().join("history.jsonl");
     let original = fs::read_to_string(&history_path).expect("read history");
-    fs::write(&history_path, format!("{original}\nnot-json\n"))
-        .expect("write malformed history");
+    fs::write(&history_path, format!("{original}\nnot-json\n")).expect("write malformed history");
 
     let (status, json, stderr) = run_json(
         &temp,
@@ -500,7 +492,11 @@ fn project_filter_accepts_full_cwd() {
     );
     assert_eq!(status, 0);
     let items = json["data"]["items"].as_array().expect("items array");
-    assert!(items.iter().any(|item| item["thread_id"] == PROJ_TWO_THREAD));
+    assert!(
+        items
+            .iter()
+            .any(|item| item["thread_id"] == PROJ_TWO_THREAD)
+    );
 }
 
 #[test]
@@ -528,14 +524,7 @@ fn messages_search_include_subagents_surfaces_sidechain_messages() {
     let _ = run_json(&temp, &["--json", "sync"]);
     let (default_status, default_json, _stderr) = run_json(
         &temp,
-        &[
-            "--json",
-            "messages",
-            "search",
-            "review",
-            "--limit",
-            "10",
-        ],
+        &["--json", "messages", "search", "review", "--limit", "10"],
     );
     assert_eq!(default_status, 0);
     let default_items = default_json["data"]["items"]
@@ -622,4 +611,317 @@ fn search_uses_existing_index_when_auto_sync_writer_is_locked() {
     assert_eq!(items[0]["thread_id"], THREAD_ONE);
 
     conn.execute_batch("ROLLBACK;").expect("unlock sqlite");
+}
+
+// -------------------------------------------------------------------------
+// Chronological listing (threads list / messages list) — fixtures + tests
+// -------------------------------------------------------------------------
+
+const THREAD_CHRONO_EARLY: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const THREAD_CHRONO_MID: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+const THREAD_CHRONO_LATE: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+const THREAD_CHRONO_UNTIMESTAMPED: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+const PROJECT_CHRONO_SLUG: &str = "-fixture-project-chrono";
+const PROJECT_CHRONO_CWD: &str = "/workspace/project-chrono";
+
+fn write_session_raw(temp: &TempDir, relative_path: &str, contents: &str) {
+    let full_path = temp.path().join(relative_path);
+    if let Some(parent) = full_path.parent() {
+        fs::create_dir_all(parent).expect("create session parent dir");
+    }
+    fs::write(&full_path, contents).expect("write session file");
+}
+
+fn add_chrono_project_threads(temp: &TempDir) {
+    write_session_raw(
+        temp,
+        "projects/-fixture-project-chrono/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.jsonl",
+        concat!(
+            r#"{"parentUuid":null,"isSidechain":false,"promptId":"prompt-chrono-early-1","type":"user","message":{"role":"user","content":"first chrono project question"},"uuid":"chrono-early-u-1","timestamp":"2026-04-11T08:00:00.000Z","userType":"external","entrypoint":"cli","cwd":"/workspace/project-chrono","sessionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","version":"2.1.101","gitBranch":"main"}"#,
+            "\n",
+            r#"{"parentUuid":"chrono-early-u-1","isSidechain":false,"message":{"model":"claude-opus-4-6","id":"msg_chrono_early_a1","type":"message","role":"assistant","content":[{"type":"text","text":"earliest chrono reply"}],"stop_reason":"end_turn"},"requestId":"req_chrono_early_a1","type":"assistant","uuid":"chrono-early-a-1","timestamp":"2026-04-11T08:00:01.000Z","userType":"external","entrypoint":"cli","cwd":"/workspace/project-chrono","sessionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","version":"2.1.101","gitBranch":"main"}"#,
+            "\n",
+        ),
+    );
+    write_session_raw(
+        temp,
+        "projects/-fixture-project-chrono/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb.jsonl",
+        concat!(
+            r#"{"parentUuid":null,"isSidechain":false,"promptId":"prompt-chrono-mid-1","type":"user","message":{"role":"user","content":"middle chrono project question"},"uuid":"chrono-mid-u-1","timestamp":"2026-04-11T10:00:00.000Z","userType":"external","entrypoint":"cli","cwd":"/workspace/project-chrono","sessionId":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","version":"2.1.101","gitBranch":"main"}"#,
+            "\n",
+            r#"{"parentUuid":"chrono-mid-u-1","isSidechain":false,"message":{"model":"claude-opus-4-6","id":"msg_chrono_mid_a1","type":"message","role":"assistant","content":[{"type":"text","text":"middle chrono reply"}],"stop_reason":"end_turn"},"requestId":"req_chrono_mid_a1","type":"assistant","uuid":"chrono-mid-a-1","timestamp":"2026-04-11T10:00:01.000Z","userType":"external","entrypoint":"cli","cwd":"/workspace/project-chrono","sessionId":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","version":"2.1.101","gitBranch":"main"}"#,
+            "\n",
+        ),
+    );
+    write_session_raw(
+        temp,
+        "projects/-fixture-project-chrono/cccccccc-cccc-4ccc-8ccc-cccccccccccc.jsonl",
+        concat!(
+            r#"{"parentUuid":null,"isSidechain":false,"promptId":"prompt-chrono-late-1","type":"user","message":{"role":"user","content":"last chrono project question"},"uuid":"chrono-late-u-1","timestamp":"2026-04-11T12:30:00.000Z","userType":"external","entrypoint":"cli","cwd":"/workspace/project-chrono","sessionId":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","version":"2.1.101","gitBranch":"main"}"#,
+            "\n",
+            r#"{"parentUuid":"chrono-late-u-1","isSidechain":false,"message":{"model":"claude-opus-4-6","id":"msg_chrono_late_a1","type":"message","role":"assistant","content":[{"type":"text","text":"latest chrono reply"}],"stop_reason":"end_turn"},"requestId":"req_chrono_late_a1","type":"assistant","uuid":"chrono-late-a-1","timestamp":"2026-04-11T12:30:01.000Z","userType":"external","entrypoint":"cli","cwd":"/workspace/project-chrono","sessionId":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","version":"2.1.101","gitBranch":"main"}"#,
+            "\n",
+        ),
+    );
+}
+
+fn add_chrono_untimestamped_thread(temp: &TempDir) {
+    write_session_raw(
+        temp,
+        "projects/-fixture-project-chrono/dddddddd-dddd-4ddd-8ddd-dddddddddddd.jsonl",
+        concat!(
+            r#"{"parentUuid":null,"isSidechain":false,"promptId":"prompt-chrono-unts-1","type":"user","message":{"role":"user","content":"untimestamped chrono project question"},"uuid":"chrono-unts-u-1","userType":"external","entrypoint":"cli","cwd":"/workspace/project-chrono","sessionId":"dddddddd-dddd-4ddd-8ddd-dddddddddddd","version":"2.1.101","gitBranch":"main"}"#,
+            "\n",
+            r#"{"parentUuid":"chrono-unts-u-1","isSidechain":false,"message":{"model":"claude-opus-4-6","id":"msg_chrono_unts_a1","type":"message","role":"assistant","content":[{"type":"text","text":"untimestamped chrono reply"}],"stop_reason":"end_turn"},"requestId":"req_chrono_unts_a1","type":"assistant","uuid":"chrono-unts-a-1","userType":"external","entrypoint":"cli","cwd":"/workspace/project-chrono","sessionId":"dddddddd-dddd-4ddd-8ddd-dddddddddddd","version":"2.1.101","gitBranch":"main"}"#,
+            "\n",
+        ),
+    );
+}
+
+#[test]
+fn threads_list_orders_chronologically_with_nulls_last() {
+    let temp = copied_fixture_home();
+    add_chrono_project_threads(&temp);
+    add_chrono_untimestamped_thread(&temp);
+    let _ = run_json(&temp, &["--json", "sync"]);
+
+    let (status, json, _stderr) = run_json(
+        &temp,
+        &[
+            "--json",
+            "threads",
+            "list",
+            "--project",
+            PROJECT_CHRONO_SLUG,
+            "--order",
+            "asc",
+            "--limit",
+            "10",
+        ],
+    );
+    assert_eq!(status, 0);
+    assert_eq!(json["data"]["order"], "asc");
+    assert_eq!(json["data"]["project"], PROJECT_CHRONO_SLUG);
+    assert_eq!(json["data"]["include_subagents"], false);
+    let items = json["data"]["items"].as_array().expect("items array");
+    let thread_ids = items
+        .iter()
+        .map(|item| item["thread_id"].as_str().expect("thread id"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        thread_ids,
+        vec![
+            THREAD_CHRONO_EARLY,
+            THREAD_CHRONO_MID,
+            THREAD_CHRONO_LATE,
+            THREAD_CHRONO_UNTIMESTAMPED,
+        ]
+    );
+    assert!(items.iter().all(|item| item["default_scope"] == true));
+    assert!(items.iter().all(|item| item["is_subagent"] == false));
+
+    let (status, json, _stderr) = run_json(
+        &temp,
+        &[
+            "--json",
+            "threads",
+            "list",
+            "--project",
+            PROJECT_CHRONO_SLUG,
+            "--order",
+            "desc",
+            "--limit",
+            "10",
+        ],
+    );
+    assert_eq!(status, 0);
+    assert_eq!(json["data"]["order"], "desc");
+    let items = json["data"]["items"].as_array().expect("items array");
+    let thread_ids = items
+        .iter()
+        .map(|item| item["thread_id"].as_str().expect("thread id"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        thread_ids,
+        vec![
+            THREAD_CHRONO_LATE,
+            THREAD_CHRONO_MID,
+            THREAD_CHRONO_EARLY,
+            THREAD_CHRONO_UNTIMESTAMPED,
+        ]
+    );
+}
+
+#[test]
+fn messages_list_supports_first_and_last_user_queries() {
+    let temp = copied_fixture_home();
+    add_chrono_project_threads(&temp);
+    add_chrono_untimestamped_thread(&temp);
+    let _ = run_json(&temp, &["--json", "sync"]);
+
+    let (status, json, _stderr) = run_json(
+        &temp,
+        &[
+            "--json",
+            "messages",
+            "list",
+            "--project",
+            PROJECT_CHRONO_CWD,
+            "--role",
+            "user",
+            "--order",
+            "asc",
+            "--limit",
+            "1",
+        ],
+    );
+    assert_eq!(status, 0);
+    assert_eq!(json["data"]["order"], "asc");
+    assert_eq!(json["data"]["role"], "user");
+    let items = json["data"]["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["thread_id"], THREAD_CHRONO_EARLY);
+    assert_eq!(items[0]["text"], "first chrono project question");
+    assert_eq!(items[0]["role"], "user");
+
+    let (status, json, _stderr) = run_json(
+        &temp,
+        &[
+            "--json",
+            "messages",
+            "list",
+            "--project",
+            PROJECT_CHRONO_CWD,
+            "--role",
+            "user",
+            "--order",
+            "desc",
+            "--limit",
+            "1",
+        ],
+    );
+    assert_eq!(status, 0);
+    assert_eq!(json["data"]["order"], "desc");
+    let items = json["data"]["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["thread_id"], THREAD_CHRONO_LATE);
+    assert_eq!(items[0]["text"], "last chrono project question");
+
+    let (status, json, _stderr) = run_json(
+        &temp,
+        &[
+            "--json",
+            "messages",
+            "list",
+            "--project",
+            PROJECT_CHRONO_SLUG,
+            "--role",
+            "user",
+            "--order",
+            "asc",
+            "--limit",
+            "10",
+        ],
+    );
+    assert_eq!(status, 0);
+    let items = json["data"]["items"].as_array().expect("items array");
+    let thread_ids = items
+        .iter()
+        .map(|item| item["thread_id"].as_str().expect("thread id"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        thread_ids,
+        vec![
+            THREAD_CHRONO_EARLY,
+            THREAD_CHRONO_MID,
+            THREAD_CHRONO_LATE,
+            THREAD_CHRONO_UNTIMESTAMPED,
+        ]
+    );
+    assert!(items.iter().all(|item| item["role"] == "user"));
+}
+
+#[test]
+fn messages_list_excludes_subagent_messages_by_default() {
+    let temp = copied_fixture_home();
+    let _ = run_json(&temp, &["--json", "sync"]);
+
+    let (status, json, _stderr) = run_json(
+        &temp,
+        &[
+            "--json",
+            "messages",
+            "list",
+            "--project",
+            PROJECT_ONE_SLUG,
+            "--order",
+            "asc",
+            "--limit",
+            "50",
+        ],
+    );
+    assert_eq!(status, 0);
+    let items = json["data"]["items"].as_array().expect("items array");
+    assert!(!items.is_empty());
+    assert!(
+        items
+            .iter()
+            .all(|item| item["project_slug"] == PROJECT_ONE_SLUG)
+    );
+    assert!(
+        items
+            .iter()
+            .all(|item| item["thread_id"] != SUBAGENT_THREAD_ID)
+    );
+}
+
+#[test]
+fn threads_list_include_subagents_surfaces_sidechain() {
+    let temp = copied_fixture_home();
+    let _ = run_json(&temp, &["--json", "sync"]);
+
+    let (default_status, default_json, _stderr) = run_json(
+        &temp,
+        &[
+            "--json",
+            "threads",
+            "list",
+            "--project",
+            PROJECT_ONE_SLUG,
+            "--limit",
+            "20",
+        ],
+    );
+    assert_eq!(default_status, 0);
+    let default_items = default_json["data"]["items"]
+        .as_array()
+        .expect("items array");
+    assert!(
+        default_items
+            .iter()
+            .all(|item| item["thread_id"] != SUBAGENT_THREAD_ID)
+    );
+
+    let (status, json, _stderr) = run_json(
+        &temp,
+        &[
+            "--json",
+            "threads",
+            "list",
+            "--project",
+            PROJECT_ONE_SLUG,
+            "--include-subagents",
+            "--limit",
+            "20",
+        ],
+    );
+    assert_eq!(status, 0);
+    assert_eq!(json["data"]["include_subagents"], true);
+    let items = json["data"]["items"].as_array().expect("items array");
+    let subagent_entry = items
+        .iter()
+        .find(|item| item["thread_id"] == SUBAGENT_THREAD_ID)
+        .expect("subagent thread surfaced with --include-subagents");
+    assert_eq!(subagent_entry["is_subagent"], true);
+    assert_eq!(subagent_entry["default_scope"], false);
 }

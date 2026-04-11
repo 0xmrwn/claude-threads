@@ -5,6 +5,7 @@ use crate::paths::ResolvedPaths;
 use clap::{ArgAction, Args, Parser, Subcommand};
 use serde::Serialize;
 use serde_json::json;
+use std::fmt;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -12,7 +13,7 @@ use serde_json::json;
     version,
     about = "Query local Claude Code conversation archives with stable JSON.",
     long_about = "Query, search, resolve, and read local Claude Code thread archives with deterministic JSON, predictable errors, and agent-friendly subcommands.",
-    after_help = "Examples:\n  claude-threads --json sync\n  claude-threads --json projects list\n  claude-threads --json threads search \"build a CLI\" --limit 20\n  claude-threads --json threads search \"refactor index\" --project sweatshop\n  claude-threads --json threads resolve \"Design claude-threads CLI\"\n  claude-threads --json threads read <thread-id>\n  claude-threads --json messages search \"archive format\" --role assistant\n  claude-threads --json events read <thread-id> --limit 50"
+    after_help = "Examples:\n  claude-threads --json sync\n  claude-threads --json projects list\n  claude-threads --json threads list --project /Users/me/Projects/sweatshop --order asc --limit 1\n  claude-threads --json threads search \"build a CLI\" --limit 20\n  claude-threads --json threads search \"refactor index\" --project sweatshop\n  claude-threads --json threads resolve \"Design claude-threads CLI\"\n  claude-threads --json threads read <thread-id>\n  claude-threads --json messages list --project /Users/me/Projects/sweatshop --role user --order asc --limit 1\n  claude-threads --json messages search \"archive format\" --role assistant\n  claude-threads --json events read <thread-id> --limit 50"
 )]
 pub struct Cli {
     #[arg(long, global = true, action = ArgAction::SetTrue, help = "Emit machine-readable JSON to stdout")]
@@ -30,10 +31,10 @@ enum Command {
     #[command(about = "List indexed projects")]
     Projects(ProjectCommand),
     #[command(subcommand)]
-    #[command(about = "Search, resolve, and read normalized threads")]
+    #[command(about = "List, search, resolve, and read normalized threads")]
     Threads(ThreadCommand),
     #[command(subcommand)]
-    #[command(about = "Search and read normalized messages")]
+    #[command(about = "List, search, and read normalized messages")]
     Messages(MessageCommand),
     #[command(subcommand)]
     #[command(about = "Read normalized event streams for a thread")]
@@ -60,12 +61,18 @@ enum ProjectCommand {
 
 #[derive(Debug, Args)]
 struct ListProjectsArgs {
-    #[arg(long, default_value_t = 50, help = "Maximum number of projects to return")]
+    #[arg(
+        long,
+        default_value_t = 50,
+        help = "Maximum number of projects to return"
+    )]
     limit: usize,
 }
 
 #[derive(Debug, Subcommand)]
 enum ThreadCommand {
+    #[command(about = "List normalized top-level threads in chronological order")]
+    List(ThreadListArgs),
     #[command(about = "Search normalized top-level threads")]
     Search(ThreadSearchArgs),
     #[command(about = "Resolve a fuzzy thread reference to one exact thread id")]
@@ -76,6 +83,8 @@ enum ThreadCommand {
 
 #[derive(Debug, Subcommand)]
 enum MessageCommand {
+    #[command(about = "List normalized top-level messages in chronological order")]
+    List(MessageListArgs),
     #[command(about = "Search normalized top-level messages")]
     Search(MessageSearchArgs),
     #[command(about = "Read one exact message by stable message id")]
@@ -124,6 +133,65 @@ struct ThreadSearchArgs {
     include_subagents: bool,
 }
 
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum SortOrder {
+    Asc,
+    Desc,
+}
+
+impl fmt::Display for SortOrder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Asc => "asc",
+            Self::Desc => "desc",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum MessageRole {
+    User,
+    Assistant,
+}
+
+impl fmt::Display for MessageRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::User => "user",
+            Self::Assistant => "assistant",
+        })
+    }
+}
+
+#[derive(Debug, Args)]
+struct ThreadListArgs {
+    #[arg(
+        long,
+        default_value_t = 20,
+        help = "Maximum number of results to return"
+    )]
+    limit: usize,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = SortOrder::Desc,
+        help = "Chronological ordering direction"
+    )]
+    order: SortOrder,
+    #[arg(
+        long,
+        allow_hyphen_values = true,
+        help = "Filter by project slug, full cwd, or substring (matches one project)"
+    )]
+    project: Option<String>,
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        help = "Include subagent / sidechain threads in results"
+    )]
+    include_subagents: bool,
+}
+
 #[derive(Debug, Args)]
 struct MessageSearchArgs {
     #[arg(help = "Search query")]
@@ -142,6 +210,37 @@ struct MessageSearchArgs {
     project: Option<String>,
     #[arg(long, help = "Filter by role (user|assistant)")]
     role: Option<String>,
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        help = "Include messages from subagent / sidechain threads"
+    )]
+    include_subagents: bool,
+}
+
+#[derive(Debug, Args)]
+struct MessageListArgs {
+    #[arg(
+        long,
+        default_value_t = 20,
+        help = "Maximum number of results to return"
+    )]
+    limit: usize,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = SortOrder::Desc,
+        help = "Chronological ordering direction"
+    )]
+    order: SortOrder,
+    #[arg(
+        long,
+        allow_hyphen_values = true,
+        help = "Filter by project slug, full cwd, or substring (matches one project)"
+    )]
+    project: Option<String>,
+    #[arg(long, value_enum, help = "Filter by exact message role")]
+    role: Option<MessageRole>,
     #[arg(
         long,
         action = ArgAction::SetTrue,
@@ -231,6 +330,33 @@ fn dispatch(cli: Cli, paths: &ResolvedPaths) -> Result<i32, (String, AppError, O
             }
         },
         Command::Threads(command) => match command {
+            ThreadCommand::List(args) => {
+                let command = "threads list";
+                match index::list_threads(
+                    paths,
+                    args.limit,
+                    args.project.as_deref(),
+                    matches!(args.order, SortOrder::Asc),
+                    args.include_subagents,
+                ) {
+                    Ok((items, auto_sync)) => {
+                        emit_success(
+                            command,
+                            cli.json,
+                            json!({
+                                "items": items,
+                                "limit": args.limit,
+                                "project": args.project,
+                                "order": args.order.to_string(),
+                                "include_subagents": args.include_subagents,
+                            }),
+                            Some(auto_sync),
+                        );
+                        Ok(0)
+                    }
+                    Err(error) => Err((command.to_string(), error, None)),
+                }
+            }
             ThreadCommand::Search(args) => {
                 let command = "threads search";
                 match index::search_threads(
@@ -289,6 +415,36 @@ fn dispatch(cli: Cli, paths: &ResolvedPaths) -> Result<i32, (String, AppError, O
             }
         },
         Command::Messages(command) => match command {
+            MessageCommand::List(args) => {
+                let command = "messages list";
+                let role_string = args.role.map(|role| role.to_string());
+                match index::list_messages(
+                    paths,
+                    args.limit,
+                    args.project.as_deref(),
+                    role_string.as_deref(),
+                    matches!(args.order, SortOrder::Asc),
+                    args.include_subagents,
+                ) {
+                    Ok((items, auto_sync)) => {
+                        emit_success(
+                            command,
+                            cli.json,
+                            json!({
+                                "items": items,
+                                "limit": args.limit,
+                                "project": args.project,
+                                "order": args.order.to_string(),
+                                "role": role_string,
+                                "include_subagents": args.include_subagents,
+                            }),
+                            Some(auto_sync),
+                        );
+                        Ok(0)
+                    }
+                    Err(error) => Err((command.to_string(), error, None)),
+                }
+            }
             MessageCommand::Search(args) => {
                 let command = "messages search";
                 if let Some(role) = args.role.as_deref()

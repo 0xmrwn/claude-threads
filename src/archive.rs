@@ -251,7 +251,10 @@ pub fn parse_thread(
                 });
             }
         } else if record_type == "user"
-            && !value.get("isMeta").and_then(Value::as_bool).unwrap_or(false)
+            && !value
+                .get("isMeta")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
         {
             if let Some(text) = extract_user_message_text(&value) {
                 let normalized = text.trim().to_string();
@@ -402,7 +405,10 @@ struct ClassifiedFile {
 
 fn classify_file(projects_root: &Utf8PathBuf, path: &Utf8PathBuf) -> Option<ClassifiedFile> {
     let rel = path.strip_prefix(projects_root).ok()?;
-    let mut components: Vec<&str> = rel.components().map(|component| component.as_str()).collect();
+    let mut components: Vec<&str> = rel
+        .components()
+        .map(|component| component.as_str())
+        .collect();
     let file_name = components.pop()?.to_string();
     let stem = file_name.strip_suffix(".jsonl")?.to_string();
 

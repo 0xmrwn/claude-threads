@@ -166,6 +166,54 @@ pub fn list_projects(
     Ok((items, auto_sync))
 }
 
+pub fn list_threads(
+    paths: &ResolvedPaths,
+    limit: usize,
+    project: Option<&str>,
+    ascending: bool,
+    include_subagents: bool,
+) -> Result<(Vec<ThreadRecord>, bool), AppError> {
+    let auto_sync = ensure_fresh(paths)?;
+    let conn = open_connection(paths, false)?;
+    let resolved_project = resolve_project_filter(&conn, project)?;
+    let direction = if ascending { "ASC" } else { "DESC" };
+
+    let mut sql = String::from(
+        "SELECT thread_id, project_slug, project_cwd, title, started_at, updated_at,
+                message_count, event_count, cli_version, git_branch, entrypoint,
+                is_subagent, parent_thread_id, agent_slug, default_scope, was_compacted, path
+         FROM threads
+         WHERE 1 = 1",
+    );
+    if !include_subagents {
+        sql.push_str(" AND default_scope = 1");
+    }
+    if resolved_project.is_some() {
+        sql.push_str(" AND project_slug = ?2");
+    }
+    sql.push_str(&format!(
+        " ORDER BY CASE WHEN COALESCE(started_at, updated_at) IS NULL THEN 1 ELSE 0 END ASC,
+                  COALESCE(started_at, updated_at, '') {direction},
+                  thread_id ASC
+         LIMIT ?1"
+    ));
+
+    let items = if let Some(slug) = resolved_project {
+        let mut stmt = conn.prepare(&sql).map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map(params![limit as i64, slug], thread_record_row)
+            .map_err(sqlite_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_err)?
+    } else {
+        let mut stmt = conn.prepare(&sql).map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map(params![limit as i64], thread_record_row)
+            .map_err(sqlite_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_err)?
+    };
+    Ok((items, auto_sync))
+}
+
 pub fn search_threads(
     paths: &ResolvedPaths,
     query: &str,
@@ -350,6 +398,64 @@ pub fn search_messages(
     Ok((hits, auto_sync))
 }
 
+pub fn list_messages(
+    paths: &ResolvedPaths,
+    limit: usize,
+    project: Option<&str>,
+    role: Option<&str>,
+    ascending: bool,
+    include_subagents: bool,
+) -> Result<(Vec<MessageRecord>, bool), AppError> {
+    let auto_sync = ensure_fresh(paths)?;
+    let conn = open_connection(paths, false)?;
+    let resolved_project = resolve_project_filter(&conn, project)?;
+    let direction = if ascending { "ASC" } else { "DESC" };
+
+    let mut sql = String::from(
+        "SELECT m.message_id, m.thread_id, t.project_slug, m.prompt_id, m.role, m.kind,
+                m.timestamp, m.text, m.snippet
+         FROM messages m
+         JOIN threads t ON t.thread_id = m.thread_id
+         WHERE 1 = 1",
+    );
+    if !include_subagents {
+        sql.push_str(" AND t.default_scope = 1");
+    }
+    let mut next_param = 2;
+    if resolved_project.is_some() {
+        sql.push_str(&format!(" AND t.project_slug = ?{next_param}"));
+        next_param += 1;
+    }
+    if role.is_some() {
+        sql.push_str(&format!(" AND m.role = ?{next_param}"));
+    }
+    sql.push_str(&format!(
+        " ORDER BY CASE WHEN m.timestamp IS NULL THEN 1 ELSE 0 END ASC,
+                  COALESCE(m.timestamp, '') {direction},
+                  m.thread_id ASC,
+                  m.ordinal ASC
+         LIMIT ?1"
+    ));
+
+    let mut stmt = conn.prepare(&sql).map_err(sqlite_err)?;
+    let mut params_vec: Vec<rusqlite::types::Value> =
+        vec![rusqlite::types::Value::Integer(limit as i64)];
+    if let Some(slug) = resolved_project {
+        params_vec.push(rusqlite::types::Value::Text(slug));
+    }
+    if let Some(role) = role {
+        params_vec.push(rusqlite::types::Value::Text(role.to_string()));
+    }
+    let rows = stmt
+        .query_map(
+            rusqlite::params_from_iter(params_vec.iter()),
+            message_record_row,
+        )
+        .map_err(sqlite_err)?;
+    let items = rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_err)?;
+    Ok((items, auto_sync))
+}
+
 pub fn read_message(
     paths: &ResolvedPaths,
     message_id: &str,
@@ -366,19 +472,7 @@ pub fn read_message(
         )
         .map_err(sqlite_err)?;
     let record = stmt
-        .query_row([message_id], |row| {
-            Ok(MessageRecord {
-                message_id: row.get(0)?,
-                thread_id: row.get(1)?,
-                project_slug: row.get(2)?,
-                prompt_id: row.get(3)?,
-                role: row.get(4)?,
-                kind: row.get(5)?,
-                timestamp: row.get(6)?,
-                text: row.get(7)?,
-                snippet: row.get(8)?,
-            })
-        })
+        .query_row([message_id], message_record_row)
         .optional()
         .map_err(sqlite_err)?
         .ok_or_else(|| {
@@ -806,12 +900,7 @@ fn insert_parsed_thread(
     tx.execute(
         "INSERT INTO files(path, thread_id, size, mtime_ns)
          VALUES(?1, ?2, ?3, ?4)",
-        params![
-            file.path.as_str(),
-            file.thread_id,
-            file.size,
-            file.mtime_ns
-        ],
+        params![file.path.as_str(), file.thread_id, file.size, file.mtime_ns],
     )
     .map_err(sqlite_err)?;
     tx.execute(
@@ -1033,6 +1122,42 @@ fn thread_search_hit_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadSear
     })
 }
 
+fn thread_record_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadRecord> {
+    Ok(ThreadRecord {
+        thread_id: row.get(0)?,
+        project_slug: row.get(1)?,
+        project_cwd: row.get(2)?,
+        title: row.get(3)?,
+        started_at: row.get(4)?,
+        updated_at: row.get(5)?,
+        message_count: row.get(6)?,
+        event_count: row.get(7)?,
+        cli_version: row.get(8)?,
+        git_branch: row.get(9)?,
+        entrypoint: row.get(10)?,
+        is_subagent: row.get::<_, i64>(11)? != 0,
+        parent_thread_id: row.get(12)?,
+        agent_slug: row.get(13)?,
+        default_scope: row.get::<_, i64>(14)? != 0,
+        was_compacted: row.get::<_, i64>(15)? != 0,
+        path: row.get(16)?,
+    })
+}
+
+fn message_record_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRecord> {
+    Ok(MessageRecord {
+        message_id: row.get(0)?,
+        thread_id: row.get(1)?,
+        project_slug: row.get(2)?,
+        prompt_id: row.get(3)?,
+        role: row.get(4)?,
+        kind: row.get(5)?,
+        timestamp: row.get(6)?,
+        text: row.get(7)?,
+        snippet: row.get(8)?,
+    })
+}
+
 fn read_thread_from_conn(
     conn: &Connection,
     thread_id: &str,
@@ -1045,29 +1170,9 @@ fn read_thread_from_conn(
              FROM threads WHERE thread_id = ?1",
         )
         .map_err(sqlite_err)?;
-    stmt.query_row([thread_id], |row| {
-        Ok(ThreadRecord {
-            thread_id: row.get(0)?,
-            project_slug: row.get(1)?,
-            project_cwd: row.get(2)?,
-            title: row.get(3)?,
-            started_at: row.get(4)?,
-            updated_at: row.get(5)?,
-            message_count: row.get(6)?,
-            event_count: row.get(7)?,
-            cli_version: row.get(8)?,
-            git_branch: row.get(9)?,
-            entrypoint: row.get(10)?,
-            is_subagent: row.get::<_, i64>(11)? != 0,
-            parent_thread_id: row.get(12)?,
-            agent_slug: row.get(13)?,
-            default_scope: row.get::<_, i64>(14)? != 0,
-            was_compacted: row.get::<_, i64>(15)? != 0,
-            path: row.get(16)?,
-        })
-    })
-    .optional()
-    .map_err(sqlite_err)
+    stmt.query_row([thread_id], thread_record_row)
+        .optional()
+        .map_err(sqlite_err)
 }
 
 fn resolve_project_filter(

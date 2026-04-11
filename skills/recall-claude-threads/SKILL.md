@@ -1,11 +1,12 @@
 ---
 name: recall-claude-threads
 description: >-
-  Search, resolve, and read past Claude Code conversation threads from local
-  ~/.claude/projects/ archives via the `claude-threads` CLI. Use whenever you
-  want to find an earlier Claude session by topic, recover decisions made in
-  prior threads, or mine successful past work for reusable patterns. Returns
-  stable JSON with `--json`. Read-only over the source archives.
+  List, search, resolve, and read past Claude Code conversation threads from
+  local ~/.claude/projects/ archives via the `claude-threads` CLI. Use whenever
+  you want to find an earlier Claude session by topic, recover decisions made
+  in prior threads, mine successful past work for reusable patterns, or pull
+  the first/last message in a project in chronological order. Returns stable
+  JSON with `--json`. Read-only over the source archives.
 ---
 
 # recall-claude-threads
@@ -21,6 +22,8 @@ sessions for reusable patterns — without loading raw transcripts into context.
 - User says "find that thread where we…", "what did we decide about…",
   "remember the session from last week about…", "show me past work on…",
   "recall the conversation about…"
+- User asks "what was my first/last message in this project?" or wants
+  threads ordered chronologically (oldest-first or newest-first)
 - Before resuming work on a topic, to recover context from a prior session
 - To quote a specific past message by exact id
 - To inspect the full event stream of one past thread
@@ -36,9 +39,16 @@ sessions for reusable patterns — without loading raw transcripts into context.
 - **Exit codes are stable.** `0` ok, `2` usage error, `3` archive not found,
   `4` index missing, `5` not found, `6` ambiguous, `7` sync failed.
 - **Default scope excludes subagents.** Pass `--include-subagents` to include
-  sidechain / `Task` tool spawns in search results.
-- **Lazy auto-sync.** Read commands sync the index automatically when stale.
-  Explicit `sync` is only needed before measuring `index stats`.
+  sidechain / `Task` tool spawns in search and list results.
+- **Lazy auto-sync.** Read, search, and list commands sync the index
+  automatically when stale. Explicit `sync` is only needed before measuring
+  `index stats`.
+- **Chronological listing is first-class.** `threads list` orders by
+  `started_at` with `updated_at` fallback and stable `thread_id` tiebreaks.
+  `messages list` orders by `timestamp`, then `thread_id`, then message
+  ordinal, and supports `--role user|assistant` for first/last message
+  queries inside a project. Rows with null timestamps always sort to the
+  end regardless of direction.
 
 ## Command surface
 
@@ -51,8 +61,8 @@ Usage: claude-threads [OPTIONS] <COMMAND>
 Commands:
   sync      Refresh the local derived index from Claude archives
   projects  List indexed projects
-  threads   Search, resolve, and read normalized threads
-  messages  Search and read normalized messages
+  threads   List, search, resolve, and read normalized threads
+  messages  List, search, and read normalized messages
   events    Read normalized event streams for a thread
   index     Inspect index statistics
   debug     Show resolved archive and index paths
@@ -74,9 +84,11 @@ Shorthand of the most useful invocations:
 ```text
 claude-threads --json sync [--rebuild]
 claude-threads --json projects list [--limit 50]
+claude-threads --json threads list [--project <slug-or-cwd>] [--order asc|desc] [--limit 20] [--include-subagents]
 claude-threads --json threads search <query> [--limit 20] [--project <slug>] [--include-subagents]
 claude-threads --json threads resolve <ref>
 claude-threads --json threads read <thread-id>
+claude-threads --json messages list [--project <slug-or-cwd>] [--role user|assistant] [--order asc|desc] [--limit 20] [--include-subagents]
 claude-threads --json messages search <query> [--limit 20] [--project <slug>] [--role user|assistant] [--include-subagents]
 claude-threads --json messages read <message-id>
 claude-threads --json events read <thread-id> [--limit 50]
@@ -97,6 +109,18 @@ Narrow to one project (slug or full cwd both work; slugs start with `-`):
 ```bash
 claude-threads --json threads search "refactor index" --project -Users-me-Projects-sweatshop
 claude-threads --json threads search "refactor index" --project /Users/me/Projects/sweatshop
+```
+
+List threads in one project, oldest-first:
+
+```bash
+claude-threads --json threads list --project /Users/me/Projects/sweatshop --order asc --limit 20
+```
+
+Find the first user message ever sent in one project:
+
+```bash
+claude-threads --json messages list --project /Users/me/Projects/sweatshop --role user --order asc --limit 1
 ```
 
 Read the full normalized record for one thread:
@@ -148,6 +172,9 @@ claude-threads --json threads search "rework plan" --limit 1 | jq -r '.data.item
 
 # Get all message ids that match a phrase
 claude-threads --json messages search "linear webhook" --limit 20 | jq -r '.data.items[].message_id'
+
+# Pull the earliest user message in one project
+claude-threads --json messages list --project /Users/me/Projects/sweatshop --role user --order asc --limit 1 | jq '.data.items[0] | {message_id, thread_id, text}'
 
 # Get the title and project_cwd for a thread you already know
 claude-threads --json threads read <thread-id> | jq '.data.thread | {title, project_cwd, was_compacted}'
