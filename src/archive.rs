@@ -55,6 +55,9 @@ pub struct ArchiveInventory {
     /// path with their `(size, mtime_ns)`; used for freshness and lookups.
     pub metadata_files: BTreeMap<Utf8PathBuf, (i64, i64)>,
     pub metadata_fingerprint: String,
+    /// Transcripts skipped because another file already claimed their thread
+    /// id, as `(skipped_path, kept_path)`; reported when a sync runs.
+    pub duplicate_files: Vec<(Utf8PathBuf, Utf8PathBuf)>,
 }
 
 /// Session metadata written by the Claude desktop app for Code tab sessions
@@ -238,12 +241,13 @@ pub fn discover_archives(paths: &ResolvedPaths) -> Result<ArchiveInventory, AppE
     }
     record_metadata_file(&paths.history_path, &mut metadata_files);
 
-    let files = dedupe_thread_ids(files);
+    let (files, duplicate_files) = dedupe_thread_ids(files);
     let metadata_fingerprint = fingerprint(&metadata_files);
     Ok(ArchiveInventory {
         files,
         metadata_files,
         metadata_fingerprint,
+        duplicate_files,
     })
 }
 
@@ -312,15 +316,15 @@ pub fn resolve_metadata(
         if inventory.metadata_files.contains_key(&sidecar)
             && let Some(raw) = read_json_file::<RawAgentMeta>(&sidecar)
         {
-            resolved.agent_type = non_empty(raw.agent_type);
-            resolved.agent_description = non_empty(raw.description);
+            resolved.agent_type = json_string(raw.agent_type);
+            resolved.agent_description = json_string(raw.description);
         }
     } else {
         let sidecar = file.path.with_extension("").join("custom-title.json");
         if inventory.metadata_files.contains_key(&sidecar)
             && let Some(raw) = read_json_file::<RawCustomTitle>(&sidecar)
         {
-            resolved.custom_title = non_empty(raw.custom_title);
+            resolved.custom_title = json_string(raw.custom_title);
         }
     }
 
@@ -482,9 +486,10 @@ pub fn parse_thread(
                     }
                 } else if let Some(text) = extract_user_message_text(&value) {
                     let hidden = bool_field(&value, "isMeta") || bool_field(&value, "isSynthetic");
-                    if let Some(class) = classify_message(&text, value.get("origin"), None, hidden)
+                    if let Some((class, body)) =
+                        classify_message(&text, value.get("origin"), None, hidden)
                     {
-                        let normalized = text.trim().to_string();
+                        let normalized = body.to_string();
                         if class == MessageClass::UserMessage && derived_title.is_none() {
                             derived_title = Some(snippet_from_text(&normalized, TITLE_CHAR_LIMIT));
                         }
@@ -530,8 +535,8 @@ pub fn parse_thread(
                         attachment.get("commandMode").and_then(Value::as_str),
                         bool_field(attachment, "isMeta"),
                     );
-                    if let Some(class) = class {
-                        let normalized = text.trim().to_string();
+                    if let Some((class, body)) = class {
+                        let normalized = body.to_string();
                         if class == MessageClass::UserMessage && derived_title.is_none() {
                             derived_title = Some(snippet_from_text(&normalized, TITLE_CHAR_LIMIT));
                         }
@@ -578,10 +583,12 @@ pub fn parse_thread(
         .history_display
         .as_ref()
         .map(|display| snippet_from_text(display, TITLE_CHAR_LIMIT));
+    // The sidecar and the desktop app title reflect the latest rename; the
+    // in-transcript `custom-title` record is copied verbatim into forks.
     let title_candidates = [
-        custom_title.as_ref().map(explicit_title),
         meta.custom_title.as_ref().map(explicit_title),
         meta.app_title.as_ref().map(explicit_title),
+        custom_title.as_ref().map(explicit_title),
         ai_title.as_ref().map(explicit_title),
         meta.agent_description.as_ref().map(explicit_title),
         derived_title,
@@ -671,15 +678,20 @@ impl MessageSink<'_> {
     }
 }
 
-/// Classifies user-role text by who actually authored it. Returns `None` for
-/// records that should not become messages (slash-command noise, hidden meta).
-fn classify_message(
-    text: &str,
+/// Classifies user-role text by who actually authored it and returns the text
+/// to index. Returns `None` for records that should not become messages
+/// (slash-command noise, hidden meta).
+fn classify_message<'a>(
+    text: &'a str,
     origin: Option<&Value>,
     command_mode: Option<&str>,
     hidden: bool,
-) -> Option<MessageClass> {
-    let trimmed = text.trim_start();
+) -> Option<(MessageClass, &'a str)> {
+    let full = text.trim();
+    // Claude Code prepends injected reminders to real prompts; index what follows.
+    let body = strip_leading_system_reminders(full);
+    let reminder_only = body.is_empty();
+    let trimmed = if reminder_only { full } else { body };
     if trimmed.is_empty() || is_local_command_noise(trimmed) {
         return None;
     }
@@ -695,14 +707,15 @@ fn classify_message(
         || trimmed.starts_with("<cross-session-message")
     {
         MessageClass::PeerMessage
-    } else if [
-        "<ci-monitor-event",
-        "<bash-stdout",
-        "<bash-stderr",
-        "<system-reminder",
-    ]
-    .iter()
-    .any(|prefix| trimmed.starts_with(prefix))
+    } else if reminder_only
+        || [
+            "<ci-monitor-event",
+            "<bash-stdout",
+            "<bash-stderr",
+            "<system-reminder",
+        ]
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix))
     {
         MessageClass::SystemEvent
     } else {
@@ -718,7 +731,20 @@ fn classify_message(
     {
         return None;
     }
-    Some(class)
+    Some((class, trimmed))
+}
+
+fn strip_leading_system_reminders(text: &str) -> &str {
+    const OPEN: &str = "<system-reminder>";
+    const CLOSE: &str = "</system-reminder>";
+    let mut rest = text.trim_start();
+    while let Some(after_open) = rest.strip_prefix(OPEN) {
+        let Some(end) = after_open.find(CLOSE) else {
+            break;
+        };
+        rest = after_open[end + CLOSE.len()..].trim_start();
+    }
+    rest
 }
 
 fn apply_app_session(resolved: &mut ThreadMetadata, session: &AppSession) {
@@ -767,15 +793,21 @@ fn collect_project_files(
             continue;
         };
 
-        let metadata = entry
-            .metadata()
-            .map_err(|error| io_error(&format!("failed to stat {path}"), error.into()))?;
-        let mtime_ns = metadata
-            .modified()
-            .ok()
-            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-            .map(|value| value.as_nanos() as i64)
-            .unwrap_or_default();
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            // Transcripts can vanish mid-walk (session cleanup); skip them.
+            Err(error)
+                if error
+                    .io_error()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                continue;
+            }
+            Err(error) => {
+                return Err(io_error(&format!("failed to stat {path}"), error.into()));
+            }
+        };
+        let mtime_ns = mtime_ns(&metadata);
         let size = metadata.len() as i64;
 
         files.push(DiscoveredFile {
@@ -858,21 +890,23 @@ fn session_dir_for_cwd(org_dir: &Utf8Path, cwd: &Utf8Path) -> Option<Utf8PathBuf
     Some(org_dir.join(first.as_str()))
 }
 
-fn dedupe_thread_ids(files: Vec<DiscoveredFile>) -> Vec<DiscoveredFile> {
+/// Keeps the first file for each thread id (Claude Code before Cowork, then
+/// path order) and returns the skipped ones alongside the file they lost to.
+fn dedupe_thread_ids(
+    files: Vec<DiscoveredFile>,
+) -> (Vec<DiscoveredFile>, Vec<(Utf8PathBuf, Utf8PathBuf)>) {
     let mut seen: BTreeMap<String, Utf8PathBuf> = BTreeMap::new();
     let mut kept = Vec::with_capacity(files.len());
+    let mut duplicates = Vec::new();
     for file in files {
         if let Some(existing) = seen.get(&file.thread_id) {
-            eprintln!(
-                "warning: skipping duplicate thread id {} at {} (already indexed from {})",
-                file.thread_id, file.path, existing
-            );
+            duplicates.push((file.path, existing.clone()));
             continue;
         }
         seen.insert(file.thread_id.clone(), file.path.clone());
         kept.push(file);
     }
-    kept
+    (kept, duplicates)
 }
 
 struct ClassifiedFile {
@@ -1000,59 +1034,58 @@ fn load_history(paths: &ResolvedPaths) -> Result<BTreeMap<String, HistoryEntry>,
     Ok(entries)
 }
 
+// Metadata fields are kept as raw JSON values so a type change in one field
+// degrades just that field instead of discarding the whole file.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawAppSession {
-    session_id: Option<String>,
-    cli_session_id: Option<String>,
-    title: Option<String>,
-    is_archived: Option<bool>,
-    last_activity_at: Option<f64>,
-    cwd: Option<String>,
-    user_selected_folders: Option<Vec<Value>>,
-    space_id: Option<String>,
+    session_id: Option<Value>,
+    cli_session_id: Option<Value>,
+    title: Option<Value>,
+    is_archived: Option<Value>,
+    last_activity_at: Option<Value>,
+    cwd: Option<Value>,
+    user_selected_folders: Option<Value>,
+    space_id: Option<Value>,
 }
 
 #[derive(Deserialize)]
 struct RawSpaces {
-    #[serde(default)]
-    spaces: Vec<RawSpace>,
-}
-
-#[derive(Deserialize)]
-struct RawSpace {
-    id: Option<String>,
-    name: Option<String>,
-    folders: Option<Vec<Value>>,
+    spaces: Option<Value>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawAgentMeta {
-    agent_type: Option<String>,
-    description: Option<String>,
+    agent_type: Option<Value>,
+    description: Option<Value>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawCustomTitle {
-    custom_title: Option<String>,
+    custom_title: Option<Value>,
 }
 
 fn read_app_session(path: &Utf8Path) -> Option<AppSession> {
     let raw = read_json_file::<RawAppSession>(path)?;
-    let app_session_id = raw
-        .session_id
-        .or_else(|| path.file_stem().map(ToOwned::to_owned))?;
+    let app_session_id =
+        json_string(raw.session_id).or_else(|| path.file_stem().map(ToOwned::to_owned))?;
     Some(AppSession {
         app_session_id,
-        cli_session_id: non_empty(raw.cli_session_id),
-        title: non_empty(raw.title),
-        is_archived: raw.is_archived.unwrap_or(false),
-        last_activity_at: raw.last_activity_at.map(|value| value as i64),
-        space_id: non_empty(raw.space_id),
-        selected_folders: folder_paths(raw.user_selected_folders),
-        cwd: raw.cwd.map(Utf8PathBuf::from),
+        cli_session_id: json_string(raw.cli_session_id),
+        title: json_string(raw.title),
+        is_archived: raw
+            .is_archived
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+        last_activity_at: raw
+            .last_activity_at
+            .and_then(|value| value.as_f64())
+            .map(|value| value as i64),
+        space_id: json_string(raw.space_id),
+        selected_folders: folder_paths(raw.user_selected_folders.as_ref()),
+        cwd: json_string(raw.cwd).map(Utf8PathBuf::from),
     })
 }
 
@@ -1060,23 +1093,36 @@ fn load_cowork_spaces(path: &Utf8Path, spaces: &mut BTreeMap<String, CoworkSpace
     let Some(raw) = read_json_file::<RawSpaces>(path) else {
         return;
     };
-    for space in raw.spaces {
-        let Some(id) = non_empty(space.id) else {
+    let Some(items) = raw.spaces.as_ref().and_then(Value::as_array) else {
+        return;
+    };
+    for space in items {
+        let Some(id) = json_string(space.get("id").cloned()) else {
             continue;
         };
         spaces.insert(
             id,
             CoworkSpace {
-                name: non_empty(space.name),
-                folders: folder_paths(space.folders),
+                name: json_string(space.get("name").cloned()),
+                folders: folder_paths(space.get("folders")),
             },
         );
     }
 }
 
+/// A trimmed, non-empty string value; any other JSON type yields `None`.
+fn json_string(value: Option<Value>) -> Option<String> {
+    match value {
+        Some(Value::String(text)) => non_empty(Some(text)),
+        _ => None,
+    }
+}
+
 /// Folder lists appear both as plain strings and as `{ "path": ... }` objects.
-fn folder_paths(values: Option<Vec<Value>>) -> Vec<String> {
+fn folder_paths(values: Option<&Value>) -> Vec<String> {
     values
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
         .unwrap_or_default()
         .iter()
         .filter_map(|value| {
@@ -1135,13 +1181,19 @@ fn record_metadata_file(path: &Utf8Path, metadata_files: &mut BTreeMap<Utf8PathB
     if !metadata.is_file() {
         return;
     }
-    let mtime_ns = metadata
+    metadata_files.insert(
+        path.to_path_buf(),
+        (metadata.len() as i64, mtime_ns(&metadata)),
+    );
+}
+
+fn mtime_ns(metadata: &std::fs::Metadata) -> i64 {
+    metadata
         .modified()
         .ok()
         .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
         .map(|value| value.as_nanos() as i64)
-        .unwrap_or_default();
-    metadata_files.insert(path.to_path_buf(), (metadata.len() as i64, mtime_ns));
+        .unwrap_or_default()
 }
 
 /// Stable FNV-1a digest over metadata file paths, sizes, and mtimes.

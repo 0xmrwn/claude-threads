@@ -1404,3 +1404,212 @@ fn outdated_index_schema_is_rebuilt_automatically() {
         .expect("read user_version");
     assert_eq!(version, 2);
 }
+
+// -------------------------------------------------------------------------
+// Review follow-ups: reminder-prefixed prompts, forks, lenient metadata,
+// Unicode space names, cwd-mapped Cowork dirs, duplicate thread ids
+// -------------------------------------------------------------------------
+
+const COWORK_ORG_DIR: &str = "desktop/local-agent-mode-sessions/acct-fixture/org-fixture";
+
+#[test]
+fn reminder_prefixed_prompts_stay_user_messages() {
+    let temp = copied_fixture_home();
+    write_session_raw(
+        &temp,
+        "projects/-fixture-project-two/9a9a9a9a-9a9a-4a9a-8a9a-9a9a9a9a9a9a.jsonl",
+        concat!(
+            r#"{"type":"user","message":{"role":"user","content":"<system-reminder>\nToday's date is 2026-04-15.\n</system-reminder>\nplease refactor the tokenizer module"},"uuid":"9a-u-1","timestamp":"2026-04-15T09:00:00.000Z","cwd":"/workspace/project-two","sessionId":"9a9a9a9a-9a9a-4a9a-8a9a-9a9a9a9a9a9a"}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":"<system-reminder>background reminder only</system-reminder>"},"uuid":"9a-u-2","timestamp":"2026-04-15T09:00:01.000Z","cwd":"/workspace/project-two","sessionId":"9a9a9a9a-9a9a-4a9a-8a9a-9a9a9a9a9a9a"}"#,
+            "\n",
+        ),
+    );
+    let _ = run_json(&temp, &["--json", "sync"]);
+    let thread_id = "9a9a9a9a-9a9a-4a9a-8a9a-9a9a9a9a9a9a";
+    let (status, json) = read_thread(&temp, thread_id);
+    assert_eq!(status, 0);
+    assert_eq!(
+        json["data"]["thread"]["title"],
+        "please refactor the tokenizer module"
+    );
+
+    let (status, json, _stderr) = run_json(
+        &temp,
+        &["--json", "messages", "read", &format!("{thread_id}:m:1")],
+    );
+    assert_eq!(status, 0);
+    let message = &json["data"]["message"];
+    assert_eq!(message["role"], "user");
+    assert_eq!(message["kind"], "user_message");
+    assert_eq!(message["text"], "please refactor the tokenizer module");
+
+    let (status, json, _stderr) = run_json(
+        &temp,
+        &["--json", "messages", "read", &format!("{thread_id}:m:2")],
+    );
+    assert_eq!(status, 0);
+    assert_eq!(json["data"]["message"]["role"], "system");
+    assert_eq!(json["data"]["message"]["kind"], "system_event");
+}
+
+#[test]
+fn desktop_title_beats_custom_title_inherited_by_forks() {
+    let temp = copied_fixture_home();
+    let fork_id = "8b8b8b8b-8b8b-4b8b-8b8b-8b8b8b8b8b8b";
+    write_session_raw(
+        &temp,
+        &format!("projects/-fixture-project-two/{fork_id}.jsonl"),
+        &format!(
+            "{}\n{}\n",
+            format_args!(
+                r#"{{"type":"custom-title","customTitle":"Parent session name","sessionId":"{fork_id}"}}"#
+            ),
+            format_args!(
+                r#"{{"type":"user","message":{{"role":"user","content":"continue the forked work"}},"uuid":"8b-u-1","timestamp":"2026-04-15T10:00:00.000Z","cwd":"/workspace/project-two","sessionId":"{fork_id}"}}"#
+            ),
+        ),
+    );
+    write_session_raw(
+        &temp,
+        "desktop/claude-code-sessions/acct-fixture/org-fixture/local_8c8c8c8c-8c8c-4c8c-8c8c-8c8c8c8c8c8c.json",
+        &format!(
+            r#"{{"sessionId":"local_8c8c8c8c-8c8c-4c8c-8c8c-8c8c8c8c8c8c","cliSessionId":"{fork_id}","title":"Parent session name (fork)","isArchived":false}}"#
+        ),
+    );
+    let _ = run_json(&temp, &["--json", "sync"]);
+    let (status, json) = read_thread(&temp, fork_id);
+    assert_eq!(status, 0);
+    assert_eq!(
+        json["data"]["thread"]["title"],
+        "Parent session name (fork)"
+    );
+}
+
+#[test]
+fn mistyped_metadata_fields_degrade_individually() {
+    let temp = copied_fixture_home();
+    let meta_path = temp
+        .path()
+        .join(COWORK_ORG_DIR)
+        .join("local_c0c0c0c0-c0c0-4c0c-8c0c-c0c0c0c0c0c0.json");
+    let original = fs::read_to_string(&meta_path).expect("read cowork meta");
+    fs::write(
+        &meta_path,
+        original
+            .replace("\"isArchived\":false", "\"isArchived\":\"no\"")
+            .replace("1775100500000", "\"2026-04-13T09:00:00Z\""),
+    )
+    .expect("write cowork meta");
+
+    let (status, _json, stderr) = run_json(&temp, &["--json", "sync"]);
+    assert_eq!(status, 0);
+    assert!(!stderr.contains("ignoring unreadable metadata"));
+    let (status, json) = read_thread(&temp, COWORK_SPACE_THREAD);
+    assert_eq!(status, 0);
+    let thread = &json["data"]["thread"];
+    assert_eq!(thread["title"], "Quarterly board deck");
+    assert_eq!(thread["project_slug"], COWORK_SPACE_SLUG);
+    assert_eq!(thread["is_archived"], false);
+}
+
+#[test]
+fn project_filter_folds_unicode_space_names() {
+    let temp = copied_fixture_home();
+    let spaces_path = temp.path().join(COWORK_ORG_DIR).join("spaces.json");
+    let spaces = fs::read_to_string(&spaces_path).expect("read spaces");
+    fs::write(
+        &spaces_path,
+        spaces.replace("Fixture Space", "Équipe Données 100%"),
+    )
+    .expect("write spaces");
+    let _ = run_json(&temp, &["--json", "sync"]);
+
+    for query in ["équipe données 100%", "ÉQUIPE", "100%"] {
+        let (status, json, _stderr) = run_json(
+            &temp,
+            &[
+                "--json",
+                "threads",
+                "list",
+                "--project",
+                query,
+                "--limit",
+                "10",
+            ],
+        );
+        assert_eq!(status, 0, "query {query}: {json}");
+        let items = json["data"]["items"].as_array().expect("items array");
+        assert_eq!(items.len(), 1, "query {query}");
+        assert_eq!(items[0]["thread_id"], COWORK_SPACE_THREAD);
+    }
+}
+
+#[test]
+fn cowork_session_dir_is_mapped_through_meta_cwd() {
+    let temp = copied_fixture_home();
+    let org_dir = temp.path().join(COWORK_ORG_DIR);
+    let session_id = "f1f1f1f1-f1f1-4f1f-8f1f-f1f1f1f1f1f1";
+    write_session_raw(
+        &temp,
+        &format!(
+            "{COWORK_ORG_DIR}/renamed-session-dir/.claude/projects/session/{session_id}.jsonl"
+        ),
+        &format!(
+            "{}\n",
+            format_args!(
+                r#"{{"type":"user","message":{{"role":"user","content":"draft the onboarding memo"}},"uuid":"f1-u-1","timestamp":"2026-04-16T09:00:00.000Z","entrypoint":"local-agent","sessionId":"{session_id}"}}"#
+            ),
+        ),
+    );
+    let cwd = org_dir.join("renamed-session-dir/outputs");
+    write_session_raw(
+        &temp,
+        &format!("{COWORK_ORG_DIR}/local_f0f0f0f0-f0f0-4f0f-8f0f-f0f0f0f0f0f0.json"),
+        &serde_json::json!({
+            "sessionId": "local_f0f0f0f0-f0f0-4f0f-8f0f-f0f0f0f0f0f0",
+            "cliSessionId": session_id,
+            "cwd": cwd.to_str().expect("utf8 cwd"),
+            "title": "Onboarding memo",
+            "spaceId": "space-fixture",
+        })
+        .to_string(),
+    );
+    let _ = run_json(&temp, &["--json", "sync"]);
+    let (status, json) = read_thread(&temp, session_id);
+    assert_eq!(status, 0);
+    let thread = &json["data"]["thread"];
+    assert_eq!(thread["title"], "Onboarding memo");
+    assert_eq!(thread["project_slug"], COWORK_SPACE_SLUG);
+    assert_eq!(
+        thread["app_session_id"],
+        "local_f0f0f0f0-f0f0-4f0f-8f0f-f0f0f0f0f0f0"
+    );
+}
+
+#[test]
+fn duplicate_thread_ids_prefer_claude_code_and_warn_on_sync() {
+    let temp = copied_fixture_home();
+    let original = fs::read_to_string(
+        temp.path()
+            .join(format!("projects/{PROJECT_ONE_SLUG}/{THREAD_TWO}.jsonl")),
+    )
+    .expect("read thread two");
+    write_session_raw(
+        &temp,
+        &format!("{COWORK_ORG_DIR}/c0c0c0c0/.claude/projects/session/{THREAD_TWO}.jsonl"),
+        &original,
+    );
+
+    let (status, json, stderr) = run_json(&temp, &["--json", "sync"]);
+    assert_eq!(status, 0);
+    assert!(stderr.contains("skipping duplicate thread id"));
+    assert_eq!(json["data"]["discovered_files"], 14);
+    let (status, json) = read_thread(&temp, THREAD_TWO);
+    assert_eq!(status, 0);
+    assert_eq!(json["data"]["thread"]["source"], "claude_code");
+
+    // Read commands on a fresh index stay quiet.
+    let (_status, _json, stderr) = run_json(&temp, &["--json", "index", "stats"]);
+    assert!(!stderr.contains("skipping duplicate thread id"));
+}

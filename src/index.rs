@@ -681,6 +681,11 @@ fn sync_with_inventory(
     inventory: ArchiveInventory,
     rebuild: bool,
 ) -> Result<SyncSummary, AppError> {
+    for (skipped, kept) in &inventory.duplicate_files {
+        eprintln!(
+            "warning: skipping duplicate thread id at {skipped} (already indexed from {kept})"
+        );
+    }
     paths.ensure_index_dir()?;
     let mut conn = open_connection(paths, true)?;
     let schema_reset = init_schema(&mut conn)?;
@@ -1290,8 +1295,9 @@ fn read_thread_from_conn(
         .map_err(sqlite_err)
 }
 
-/// Resolves `--project` by exact slug, exact cwd, exact display name, then a
-/// unique substring of any of those.
+/// Resolves `--project` by exact slug, exact cwd, case-insensitive display
+/// name, then a unique case-insensitive substring of any of those. Matching
+/// runs in Rust so non-ASCII names fold correctly and `%`/`_` stay literal.
 fn resolve_project_filter(
     conn: &Connection,
     project: Option<&str>,
@@ -1304,35 +1310,64 @@ fn resolve_project_filter(
         return Ok(None);
     }
 
-    for sql in [
-        "SELECT project_slug FROM projects WHERE project_slug = ?1",
-        "SELECT project_slug FROM projects WHERE project_cwd = ?1 ORDER BY thread_count DESC LIMIT 1",
-        "SELECT project_slug FROM projects WHERE lower(project_name) = lower(?1)
-         ORDER BY thread_count DESC LIMIT 1",
-    ] {
-        let mut stmt = conn.prepare(sql).map_err(sqlite_err)?;
-        if let Some(slug) = stmt
-            .query_row([trimmed], |row| row.get::<_, String>(0))
-            .optional()
-            .map_err(sqlite_err)?
-        {
-            return Ok(Some(slug));
-        }
+    struct Candidate {
+        slug: String,
+        cwd: Option<String>,
+        name: Option<String>,
     }
-
-    let mut by_substring = conn
+    let mut stmt = conn
         .prepare(
-            "SELECT project_slug FROM projects
-             WHERE project_slug LIKE ?1 OR project_cwd LIKE ?1 OR project_name LIKE ?1
-             ORDER BY thread_count DESC, project_slug
-             LIMIT 5",
+            "SELECT project_slug, project_cwd, project_name FROM projects
+             ORDER BY thread_count DESC, project_slug",
         )
         .map_err(sqlite_err)?;
-    let pattern = format!("%{trimmed}%");
-    let rows = by_substring
-        .query_map([pattern], |row| row.get::<_, String>(0))
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(Candidate {
+                slug: row.get(0)?,
+                cwd: row.get(1)?,
+                name: row.get(2)?,
+            })
+        })
         .map_err(sqlite_err)?;
-    let mut matches = rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_err)?;
+    let projects = rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_err)?;
+
+    let folded = trimmed.to_lowercase();
+    let exact = projects
+        .iter()
+        .find(|project| project.slug == trimmed)
+        .or_else(|| {
+            projects
+                .iter()
+                .find(|project| project.cwd.as_deref() == Some(trimmed))
+        })
+        .or_else(|| {
+            projects.iter().find(|project| {
+                project
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.to_lowercase() == folded)
+            })
+        });
+    if let Some(project) = exact {
+        return Ok(Some(project.slug.clone()));
+    }
+
+    let mut matches = projects
+        .iter()
+        .filter(|project| {
+            [
+                Some(project.slug.as_str()),
+                project.cwd.as_deref(),
+                project.name.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|field| field.to_lowercase().contains(&folded))
+        })
+        .map(|project| project.slug.clone())
+        .take(5)
+        .collect::<Vec<_>>();
     if matches.is_empty() {
         return Err(AppError::with_details(
             ErrorCode::NotFound,
