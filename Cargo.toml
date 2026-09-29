@@ -1,9 +1,9 @@
 [package]
 name = "claude-threads"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
-description = "Local CLI for querying Claude Code session archives with stable JSON, predictable errors, and minimal noise."
+description = "Local CLI for querying Claude Code and Cowork session archives with stable JSON, predictable errors, and minimal noise."
 repository = "https://github.com/0xmrwn/claude-threads"
 readme = "README.md"
 

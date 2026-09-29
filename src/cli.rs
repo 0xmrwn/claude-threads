@@ -11,9 +11,9 @@ use std::fmt;
 #[command(
     name = "claude-threads",
     version,
-    about = "Query local Claude Code conversation archives with stable JSON.",
-    long_about = "Query, search, resolve, and read local Claude Code thread archives with deterministic JSON, predictable errors, and agent-friendly subcommands.",
-    after_help = "Examples:\n  claude-threads --json sync\n  claude-threads --json projects list\n  claude-threads --json threads list --project /Users/me/Projects/sweatshop --order asc --limit 1\n  claude-threads --json threads search \"build a CLI\" --limit 20\n  claude-threads --json threads search \"refactor index\" --project sweatshop\n  claude-threads --json threads resolve \"Design claude-threads CLI\"\n  claude-threads --json threads read <thread-id>\n  claude-threads --json messages list --project /Users/me/Projects/sweatshop --role user --order asc --limit 1\n  claude-threads --json messages search \"archive format\" --role assistant\n  claude-threads --json events read <thread-id> --limit 50"
+    about = "Query local Claude Code and Cowork conversation archives with stable JSON.",
+    long_about = "Query, search, resolve, and read local Claude Code and Claude desktop Cowork thread archives with deterministic JSON, predictable errors, and agent-friendly subcommands.",
+    after_help = "Examples:\n  claude-threads --json sync\n  claude-threads --json projects list\n  claude-threads --json threads list --project /Users/me/Projects/sweatshop --order asc --limit 1\n  claude-threads --json threads list --source cowork --limit 10\n  claude-threads --json threads search \"build a CLI\" --limit 20\n  claude-threads --json threads search \"refactor index\" --project sweatshop\n  claude-threads --json threads resolve \"Design claude-threads CLI\"\n  claude-threads --json threads read <thread-id>\n  claude-threads --json messages list --project /Users/me/Projects/sweatshop --role user --order asc --limit 1\n  claude-threads --json messages search \"archive format\" --role assistant\n  claude-threads --json messages search \"quarterly deck\" --source cowork\n  claude-threads --json events read <thread-id> --limit 50\n\nEnvironment:\n  CLAUDE_HOME           Claude Code home (default: ~/.claude)\n  CLAUDE_DESKTOP_HOME   Claude desktop app data dir holding Cowork sessions\n                        (default: ~/Library/Application Support/Claude on macOS)"
 )]
 pub struct Cli {
     #[arg(long, global = true, action = ArgAction::SetTrue, help = "Emit machine-readable JSON to stdout")]
@@ -25,7 +25,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    #[command(about = "Refresh the local derived index from Claude archives")]
+    #[command(about = "Refresh the local derived index from Claude Code and Cowork archives")]
     Sync(SyncArgs),
     #[command(subcommand)]
     #[command(about = "List indexed projects")]
@@ -122,9 +122,15 @@ struct ThreadSearchArgs {
     #[arg(
         long,
         allow_hyphen_values = true,
-        help = "Filter by project slug, full cwd, or substring (matches one project)"
+        help = "Filter by project slug, full cwd, Cowork space name, or unique substring"
     )]
     project: Option<String>,
+    #[arg(
+        long,
+        value_enum,
+        help = "Filter by archive source (claude-code|cowork)"
+    )]
+    source: Option<SourceFilter>,
     #[arg(
         long,
         action = ArgAction::SetTrue,
@@ -152,6 +158,7 @@ impl fmt::Display for SortOrder {
 enum MessageRole {
     User,
     Assistant,
+    System,
 }
 
 impl fmt::Display for MessageRole {
@@ -159,7 +166,24 @@ impl fmt::Display for MessageRole {
         f.write_str(match self {
             Self::User => "user",
             Self::Assistant => "assistant",
+            Self::System => "system",
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum SourceFilter {
+    #[value(name = "claude-code", alias = "claude_code")]
+    ClaudeCode,
+    Cowork,
+}
+
+impl SourceFilter {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude_code",
+            Self::Cowork => "cowork",
+        }
     }
 }
 
@@ -181,9 +205,15 @@ struct ThreadListArgs {
     #[arg(
         long,
         allow_hyphen_values = true,
-        help = "Filter by project slug, full cwd, or substring (matches one project)"
+        help = "Filter by project slug, full cwd, Cowork space name, or unique substring"
     )]
     project: Option<String>,
+    #[arg(
+        long,
+        value_enum,
+        help = "Filter by archive source (claude-code|cowork)"
+    )]
+    source: Option<SourceFilter>,
     #[arg(
         long,
         action = ArgAction::SetTrue,
@@ -205,11 +235,17 @@ struct MessageSearchArgs {
     #[arg(
         long,
         allow_hyphen_values = true,
-        help = "Filter by project slug, full cwd, or substring (matches one project)"
+        help = "Filter by project slug, full cwd, Cowork space name, or unique substring"
     )]
     project: Option<String>,
-    #[arg(long, help = "Filter by role (user|assistant)")]
+    #[arg(long, help = "Filter by role (user|assistant|system)")]
     role: Option<String>,
+    #[arg(
+        long,
+        value_enum,
+        help = "Filter by archive source (claude-code|cowork)"
+    )]
+    source: Option<SourceFilter>,
     #[arg(
         long,
         action = ArgAction::SetTrue,
@@ -236,11 +272,17 @@ struct MessageListArgs {
     #[arg(
         long,
         allow_hyphen_values = true,
-        help = "Filter by project slug, full cwd, or substring (matches one project)"
+        help = "Filter by project slug, full cwd, Cowork space name, or unique substring"
     )]
     project: Option<String>,
     #[arg(long, value_enum, help = "Filter by exact message role")]
     role: Option<MessageRole>,
+    #[arg(
+        long,
+        value_enum,
+        help = "Filter by archive source (claude-code|cowork)"
+    )]
+    source: Option<SourceFilter>,
     #[arg(
         long,
         action = ArgAction::SetTrue,
@@ -332,10 +374,12 @@ fn dispatch(cli: Cli, paths: &ResolvedPaths) -> Result<i32, (String, AppError, O
         Command::Threads(command) => match command {
             ThreadCommand::List(args) => {
                 let command = "threads list";
+                let source = args.source.map(SourceFilter::as_str);
                 match index::list_threads(
                     paths,
                     args.limit,
                     args.project.as_deref(),
+                    source,
                     matches!(args.order, SortOrder::Asc),
                     args.include_subagents,
                 ) {
@@ -347,6 +391,7 @@ fn dispatch(cli: Cli, paths: &ResolvedPaths) -> Result<i32, (String, AppError, O
                                 "items": items,
                                 "limit": args.limit,
                                 "project": args.project,
+                                "source": source,
                                 "order": args.order.to_string(),
                                 "include_subagents": args.include_subagents,
                             }),
@@ -359,11 +404,13 @@ fn dispatch(cli: Cli, paths: &ResolvedPaths) -> Result<i32, (String, AppError, O
             }
             ThreadCommand::Search(args) => {
                 let command = "threads search";
+                let source = args.source.map(SourceFilter::as_str);
                 match index::search_threads(
                     paths,
                     &args.query,
                     args.limit,
                     args.project.as_deref(),
+                    source,
                     args.include_subagents,
                 ) {
                     Ok((items, auto_sync)) => {
@@ -374,6 +421,7 @@ fn dispatch(cli: Cli, paths: &ResolvedPaths) -> Result<i32, (String, AppError, O
                                 "items": items,
                                 "limit": args.limit,
                                 "project": args.project,
+                                "source": source,
                                 "include_subagents": args.include_subagents,
                             }),
                             Some(auto_sync),
@@ -418,11 +466,13 @@ fn dispatch(cli: Cli, paths: &ResolvedPaths) -> Result<i32, (String, AppError, O
             MessageCommand::List(args) => {
                 let command = "messages list";
                 let role_string = args.role.map(|role| role.to_string());
+                let source = args.source.map(SourceFilter::as_str);
                 match index::list_messages(
                     paths,
                     args.limit,
                     args.project.as_deref(),
                     role_string.as_deref(),
+                    source,
                     matches!(args.order, SortOrder::Asc),
                     args.include_subagents,
                 ) {
@@ -434,6 +484,7 @@ fn dispatch(cli: Cli, paths: &ResolvedPaths) -> Result<i32, (String, AppError, O
                                 "items": items,
                                 "limit": args.limit,
                                 "project": args.project,
+                                "source": source,
                                 "order": args.order.to_string(),
                                 "role": role_string,
                                 "include_subagents": args.include_subagents,
@@ -448,25 +499,26 @@ fn dispatch(cli: Cli, paths: &ResolvedPaths) -> Result<i32, (String, AppError, O
             MessageCommand::Search(args) => {
                 let command = "messages search";
                 if let Some(role) = args.role.as_deref()
-                    && role != "user"
-                    && role != "assistant"
+                    && !matches!(role, "user" | "assistant" | "system")
                 {
                     return Err((
                         command.to_string(),
                         AppError::with_details(
                             ErrorCode::UsageError,
-                            "--role must be 'user' or 'assistant'",
+                            "--role must be 'user', 'assistant', or 'system'",
                             json!({ "role": role }),
                         ),
                         None,
                     ));
                 }
+                let source = args.source.map(SourceFilter::as_str);
                 match index::search_messages(
                     paths,
                     &args.query,
                     args.limit,
                     args.project.as_deref(),
                     args.role.as_deref(),
+                    source,
                     args.include_subagents,
                 ) {
                     Ok((items, auto_sync)) => {
@@ -477,6 +529,7 @@ fn dispatch(cli: Cli, paths: &ResolvedPaths) -> Result<i32, (String, AppError, O
                                 "items": items,
                                 "limit": args.limit,
                                 "project": args.project,
+                                "source": source,
                                 "role": args.role,
                                 "include_subagents": args.include_subagents,
                             }),
@@ -539,10 +592,18 @@ fn dispatch(cli: Cli, paths: &ResolvedPaths) -> Result<i32, (String, AppError, O
                     "claude_home": paths.claude_home,
                     "projects_root": paths.projects_root,
                     "history_path": paths.history_path,
+                    "desktop_home": paths.desktop_home,
+                    "cowork_root": paths.cowork_root,
+                    "desktop_sessions_root": paths.desktop_sessions_root,
                     "index_dir": paths.index_dir,
                     "index_path": paths.index_path,
                     "projects_root_exists": paths.projects_root.exists(),
                     "history_exists": paths.history_path.exists(),
+                    "cowork_root_exists": paths.cowork_root.as_ref().is_some_and(|root| root.is_dir()),
+                    "desktop_sessions_root_exists": paths
+                        .desktop_sessions_root
+                        .as_ref()
+                        .is_some_and(|root| root.is_dir()),
                     "index_exists": paths.index_path.exists(),
                 });
                 emit_success(command, cli.json, payload, None);
